@@ -30,11 +30,53 @@ tools=[search_tool]
 
 checkpointer=MemorySaver()
 
-llm_eith_tools=llm.bind_tools(tools=tools)
+llm_with_tools=llm.bind_tools(tools=tools)
 
 
 class AgentState(TypedDict):
     messages:Annotated[list,add_messages]
 
 
+#first node
+async def model(state:AgentState):
+    result=await llm_with_tools.ainvoke(state["messages"])
+    return {
+        "messages":result
+
+    }
+
+
+
+#tool router
+async def tools_router(state:AgentState):
+    last_message=state["messages"][-1]
+
+    if(hasattr(last_message,"tool_calling")and len(last_message.tool_calling)>0):
+        return "tool_node"
+    else:
+        return END
     
+
+#node that handles tool calls from LLMs
+async def tool_node(state):
+    """Custom tool node that handles tool calls from the LLM."""
+    #Get the tool calls from the last message
+    tool_calling=state["messages"][-1].tool_calling
+    tool_messages=[]
+    for tool_call in tool_calling:
+        tool_name=tool_call['name']
+        tool_args=tool_call['args']
+        tool_id=tool_call["id"]
+
+        #handle the search toool
+        if tool_name=="tavily_search_results_json":
+            #execute the search tool with the provided aruguments
+            search_results=await search_tool.ainvoke(tool_args)
+            tool_message=ToolMessage(
+                content=str(search_results),
+                tool_call_id=tool_id,
+                name=tool_name
+            ) 
+            tool_messages.append(tool_message)
+    return {"messages": tool_messages}
+   
