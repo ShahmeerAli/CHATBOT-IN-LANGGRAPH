@@ -3,11 +3,12 @@ from langgraph.graph import StateGraph,END,add_messages
 from dotenv import  load_dotenv,find_dotenv
 from langchain_groq import ChatGroq
 import os
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
 from  langgraph.checkpoint.memory import MemorySaver
 from uuid import uuid4
 from langchain_core.messages import AIMessage,HumanMessage,ToolMessage
 import json
+import asyncio
 
 
 load_dotenv()
@@ -22,13 +23,13 @@ llm=ChatGroq(
 
 
 
-search_tool=TavilySearchResults()
+search_tool=TavilySearch()
 
 
 
 tools=[search_tool]
 
-checkpointer=MemorySaver()
+memoy=MemorySaver()
 
 llm_with_tools=llm.bind_tools(tools=tools)
 
@@ -51,7 +52,7 @@ async def model(state:AgentState):
 async def tools_router(state:AgentState):
     last_message=state["messages"][-1]
 
-    if(hasattr(last_message,"tool_calling")and len(last_message.tool_calling)>0):
+    if(hasattr(last_message,"tool_calls")and len(last_message.tool_calls)>0):
         return "tool_node"
     else:
         return END
@@ -61,7 +62,7 @@ async def tools_router(state:AgentState):
 async def tool_node(state):
     """Custom tool node that handles tool calls from the LLM."""
     #Get the tool calls from the last message
-    tool_calling=state["messages"][-1].tool_calling
+    tool_calling=state["messages"][-1].tool_calls
     tool_messages=[]
     for tool_call in tool_calling:
         tool_name=tool_call['name']
@@ -79,4 +80,41 @@ async def tool_node(state):
             ) 
             tool_messages.append(tool_message)
     return {"messages": tool_messages}
-   
+
+
+system_prompt = HumanMessage(content=
+    "You are a helpful assistant. "
+    "Use the search tool *only if the user asks about factual, external knowledge* "
+    "that you are not confident about. "
+    "For casual conversation (like greetings, introductions, chit-chat), "
+    "do NOT use any tools."
+)
+
+graph=StateGraph(AgentState)
+
+graph.add_node("model",model)
+graph.add_node("tool_node",tool_node)
+
+graph.set_entry_point("model")
+graph.add_conditional_edges("model",tools_router)
+graph.add_edge("tool_node","model")
+
+
+
+config={
+    "configurable":{
+        "thread_id":3
+    }
+}
+
+graph_builder=graph.compile(checkpointer=memoy)
+
+async def run():
+   response=await graph_builder.ainvoke({
+    "messages":[system_prompt,HumanMessage(content="What is my name?")],
+   },config=config)
+
+   print(response["messages"][-1].content)
+
+
+asyncio.run(run())   
