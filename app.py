@@ -3,10 +3,13 @@ from langgraph.graph import StateGraph,END,add_messages
 from dotenv import  load_dotenv,find_dotenv
 from langchain_groq import ChatGroq
 import os
+from fastapi import FastAPI,Query
 from langchain_tavily import TavilySearch
 from  langgraph.checkpoint.memory import MemorySaver
 from uuid import uuid4
-from langchain_core.messages import AIMessage,HumanMessage,ToolMessage
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessageChunk,AIMessage,SystemMessage,HumanMessage,ToolMessage
 import json
 import asyncio
 
@@ -21,7 +24,7 @@ llm=ChatGroq(
     groq_api_key=os.environ.get("GROQAPI_KEY")
 )
 
-
+api=FastAPI()
 
 search_tool=TavilySearch()
 
@@ -42,7 +45,7 @@ class AgentState(TypedDict):
 async def model(state:AgentState):
     result=await llm_with_tools.ainvoke(state["messages"])
     return {
-        "messages":result
+        "messages":[result]
 
     }
 
@@ -82,7 +85,7 @@ async def tool_node(state):
     return {"messages": tool_messages}
 
 
-system_prompt = HumanMessage(content=
+system_prompt =SystemMessage(content=
     "You are a helpful assistant. "
     "Use the search tool *only if the user asks about factual, external knowledge* "
     "that you are not confident about. "
@@ -109,12 +112,92 @@ config={
 
 graph_builder=graph.compile(checkpointer=memoy)
 
-async def run():
-   response=await graph_builder.ainvoke({
-    "messages":[system_prompt,HumanMessage(content="What is my name?")],
-   },config=config)
-
-   print(response["messages"][-1].content)
 
 
-asyncio.run(run())   
+async def main():
+    async for event in graph_builder.astream_events(
+        {"messages": [system_prompt, HumanMessage(content="tell me about tesla optimus robot")]},
+        config=config,
+        version='v2'
+    ):
+      if event['event']=="on_chat_model_end":
+          print(event['data']['output'].content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+#FAST API IMPLEMENTATION
+#CREATING CORS MIDDLEWARW TO 
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Type"]    
+
+)
+
+def serialize_ai_message_chunk(chunk):
+    if(isinstance(chunk,AIMessageChunk)):
+        return chunk.content
+    else:
+        raise TypeError(
+            f"Object of type {type(chunk).__name__} is not correct formatted for serialization"
+        )
+
+
+
+async def generate_chat_responses(message:str,checkpoint_id:Optional[str]=None):
+    is_new_connection=checkpoint_id is None
+
+    if is_new_connection:
+        #generating nwe checkpointer id for the message
+        new_checkpoint_id=str(uuid4())
+
+        config={
+            "configurable":{
+                "thread_id":new_checkpoint_id
+            }
+        }
+
+        #initialize the first message
+        events=graph_builder.astream_events(
+            {
+                "messages":[HumanMessage(content=message)]
+            },
+            version='v2',
+            config=config
+        )
+        #first send the checkpoint ID
+        yield f"data{{\"type\":\"checkpoint\",\"checkpoint_id\" : \"{new_checkpoint_id}\" }}\n\n"
+    else:
+        config={
+            "configurable":{
+                "thread_id":checkpoint_id
+            }
+        }    
+        #continue existing the conversation
+
+        events=graph_builder.astream_events(
+            {"messages": [HumanMessage(content=message)]},
+            version="v2",
+            config=config
+        )
+    #executyion remaining
+    
+
+
+
+@api.get(".chat_stream/{message}")
+async def chat_stream(message:str,checkpoint_id:Optional[str]=Query(None)):
+   return StreamingResponse(
+       generate_chat_responses(message,checkpoint_id),
+       media_type="text/event-stream"
+   )
+
+
+
