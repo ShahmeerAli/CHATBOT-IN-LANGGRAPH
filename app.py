@@ -4,7 +4,7 @@ from dotenv import  load_dotenv,find_dotenv
 from langchain_groq import ChatGroq
 import os
 from fastapi import FastAPI,Query
-from langchain_tavily import TavilySearch
+from langchain_community.tools.tavily_search import TavilySearchResults
 from  langgraph.checkpoint.memory import MemorySaver
 from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +26,7 @@ llm=ChatGroq(
 
 api=FastAPI()
 
-search_tool=TavilySearch()
+search_tool=TavilySearchResults()
 
 
 
@@ -104,27 +104,21 @@ graph.add_edge("tool_node","model")
 
 
 
-config={
-    "configurable":{
-        "thread_id":3
-    }
-}
-
 graph_builder=graph.compile(checkpointer=memoy)
 
 
 
-async def main():
-    async for event in graph_builder.astream_events(
-        {"messages": [system_prompt, HumanMessage(content="tell me about tesla optimus robot")]},
-        config=config,
-        version='v2'
-    ):
-      if event['event']=="on_chat_model_end":
-          print(event['data']['output'].content)
+# async def main():
+#     async for event in graph_builder.astream_events(
+#         {"messages": [system_prompt, HumanMessage(content="tell me about tesla optimus robot")]},
+#         config=config,
+#         version='v2'
+#     ):
+#       if event['event']=="on_chat_model_end":
+#           print(event['data']['output'].content)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())
 
 
 
@@ -142,13 +136,21 @@ api.add_middleware(
 )
 
 def serialize_ai_message_chunk(chunk):
-    if(isinstance(chunk,AIMessageChunk)):
-        return chunk.content
-    else:
-        raise TypeError(
-            f"Object of type {type(chunk).__name__} is not correct formatted for serialization"
-        )
-
+    if isinstance(chunk, AIMessageChunk):
+      
+        if chunk.content:
+            return chunk.content
+        
+        if hasattr(chunk, "delta") and chunk.delta:
+            if isinstance(chunk.delta, list):
+                return "".join(
+                    d.get("content", "") for d in chunk.delta if isinstance(d, dict)
+                )
+            elif isinstance(chunk.delta, dict):
+                return chunk.delta.get("content", "")
+        
+        return ""  
+    return str(chunk)
 
 
 async def generate_chat_responses(message:str,checkpoint_id:Optional[str]=None):
@@ -167,7 +169,7 @@ async def generate_chat_responses(message:str,checkpoint_id:Optional[str]=None):
         #initialize the first message
         events=graph_builder.astream_events(
             {
-                "messages":[HumanMessage(content=message)]
+                "messages":[system_prompt,HumanMessage(content=message)]
             },
             version='v2',
             config=config
@@ -187,17 +189,47 @@ async def generate_chat_responses(message:str,checkpoint_id:Optional[str]=None):
             version="v2",
             config=config
         )
-    #executyion remaining
+    async for event in events:
+        event_type=event['event']
+
+        if event_type=="on_chat_model_stream":
+            chunk_content=serialize_ai_message_chunk(event['data']['chunk'])
+            #escape the single quotes and the newlines for safe JSON parsing
+            safe_content=chunk_content.replace("'", "\\'").replace("\n","\\n")
+
+        
+
+            yield f"data:{{\"type\":\"content\", \"content\":\"{safe_content}\"}}\n\n"
+        elif event_type=="on_chat_model_end":
+            tool_calls=event['data']['output'].tool_calls if hasattr(event['data']['output'],"tool_calls") else []
+            search_calls=[call for call in tool_calls if call['name']=="tavily_search_results_json"]
+
+            if search_calls:
+                search_query=search_calls[0]["args"].get("query","")
+                safe_query=search_query.replace('"','\\"').replace("\n","\n")
+                yield f"data: {{\"type\": \"search_start\", \"query\": \"{safe_query}\"}}\n\n"
+        elif event_type=="on_tool_end" and event['name']=="tavily_search_results_json":
+            output=event['data']['output']
+
+            if isinstance(output,list):
+
+                urls=[]
+                for item in output:
+                    if isinstance(item,dict) and 'url' in item:
+                        urls.append(item["url"])         
+                
+                urls_json=json.dumps(urls)
+                yield f"data: {{\"type\": \"search_results\", \"urls\": {urls_json}}}\n\n"
+    yield f"data: {{\"type\": \"end\"}}\n\n"
+                       
     
 
 
 
-@api.get(".chat_stream/{message}")
+@api.get("/chat_stream/{message}")
 async def chat_stream(message:str,checkpoint_id:Optional[str]=Query(None)):
    return StreamingResponse(
        generate_chat_responses(message,checkpoint_id),
        media_type="text/event-stream"
    )
-
-
 
