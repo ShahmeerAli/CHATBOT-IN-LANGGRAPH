@@ -10,13 +10,17 @@ from uuid import uuid4
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk,AIMessage,SystemMessage,HumanMessage,ToolMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import aiosqlite 
 import json
+import sqlite3
 import asyncio
 
 
 load_dotenv()
 
 
+#added checkpoints in the form of sqlite
 GROQ_API_KEY=os.environ['GROQAPI_KEY']
 
 llm=ChatGroq(
@@ -32,13 +36,17 @@ search_tool=TavilySearchResults()
 
 tools=[search_tool]
 
-memoy=MemorySaver()
+sql_connection=aiosqlite.connect("memory.sqlite",check_same_thread=False)
+
+memory=AsyncSqliteSaver(conn=sql_connection)
+
 
 llm_with_tools=llm.bind_tools(tools=tools)
 
 
 class AgentState(TypedDict):
     messages:Annotated[list,add_messages]
+
 
 
 #first node
@@ -91,6 +99,7 @@ system_prompt =SystemMessage(content=
     "that you are not confident about. "
     "For casual conversation (like greetings, introductions, chit-chat), "
     "do NOT use any tools."
+    "for user details go to the memory file.If the user tells his/her name remember it"
 )
 
 graph=StateGraph(AgentState)
@@ -104,26 +113,10 @@ graph.add_edge("tool_node","model")
 
 
 
-graph_builder=graph.compile(checkpointer=memoy)
+
+graph_builder=graph.compile(checkpointer=memory)
 
 
-
-# async def main():
-#     async for event in graph_builder.astream_events(
-#         {"messages": [system_prompt, HumanMessage(content="tell me about tesla optimus robot")]},
-#         config=config,
-#         version='v2'
-#     ):
-#       if event['event']=="on_chat_model_end":
-#           print(event['data']['output'].content)
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
-
-
-
-#FAST API IMPLEMENTATION
-#CREATING CORS MIDDLEWARW TO 
 
 api.add_middleware(
     CORSMiddleware,
@@ -153,77 +146,62 @@ def serialize_ai_message_chunk(chunk):
     return str(chunk)
 
 
-async def generate_chat_responses(message:str,checkpoint_id:Optional[str]=None):
-    is_new_connection=checkpoint_id is None
 
-    if is_new_connection:
-        #generating nwe checkpointer id for the message
-        new_checkpoint_id=str(uuid4())
+async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = None):
+   
+    config = {"configurable": {"thread_id": checkpoint_id}}
 
-        config={
-            "configurable":{
-                "thread_id":new_checkpoint_id
-            }
-        }
-
-        #initialize the first message
-        events=graph_builder.astream_events(
-            {
-                "messages":[system_prompt,HumanMessage(content=message)]
-            },
-            version='v2',
-            config=config
-        )
-        #first send the checkpoint ID
-        yield f"data{{\"type\":\"checkpoint\",\"checkpoint_id\" : \"{new_checkpoint_id}\" }}\n\n"
-    else:
-        config={
-            "configurable":{
-                "thread_id":checkpoint_id
-            }
-        }    
-        #continue existing the conversation
-
-        events=graph_builder.astream_events(
-            {"messages": [HumanMessage(content=message)]},
-            version="v2",
-            config=config
-        )
-    async for event in events:
-        event_type=event['event']
-
-        if event_type=="on_chat_model_stream":
-            chunk_content=serialize_ai_message_chunk(event['data']['chunk'])
-            #escape the single quotes and the newlines for safe JSON parsing
-            safe_content=chunk_content.replace("'", "\\'").replace("\n","\\n")
-
+    if checkpoint_id is None:
+    
+        new_checkpoint_id = str(uuid4())
+        config["configurable"]["thread_id"] = new_checkpoint_id
         
+        
+        inputs = {"messages": [system_prompt, HumanMessage(content=message)]}
+        yield f"data: {{\"type\":\"checkpoint\",\"checkpoint_id\":\"{new_checkpoint_id}\"}}\n\n"
+    else:
+    
+        inputs = {"messages": [HumanMessage(content=message)]}
 
-            yield f"data:{{\"type\":\"content\", \"content\":\"{safe_content}\"}}\n\n"
-        elif event_type=="on_chat_model_end":
-            tool_calls=event['data']['output'].tool_calls if hasattr(event['data']['output'],"tool_calls") else []
-            search_calls=[call for call in tool_calls if call['name']=="tavily_search_results_json"]
+    events = graph_builder.astream_events(
+        inputs,
+        config=config,
+        version="v2"
+    )
+
+    async for event in events:
+        event_type = event['event']
+
+        if event_type == "on_chat_model_stream":
+            chunk_content = serialize_ai_message_chunk(event['data']['chunk'])
+            if not chunk_content:
+                continue
+            safe_content = json.dumps(chunk_content)[1:-1]
+            yield f"data: {{\"type\": \"content\", \"content\": \"{safe_content}\"}}\n\n"
+
+        elif event_type == "on_chat_model_end":
+            tool_calls = getattr(event['data']['output'], "tool_calls", [])
+            search_calls = [call for call in tool_calls if call['name'] == "tavily_search_results_json"]
 
             if search_calls:
-                search_query=search_calls[0]["args"].get("query","")
-                safe_query=search_query.replace('"','\\"').replace("\n","\n")
+                search_query = search_calls[0]["args"].get("query", "")
+                safe_query = json.dumps(search_query)[1:-1]
                 yield f"data: {{\"type\": \"search_start\", \"query\": \"{safe_query}\"}}\n\n"
-        elif event_type=="on_tool_end" and event['name']=="tavily_search_results_json":
-            output=event['data']['output']
 
-            if isinstance(output,list):
-
-                urls=[]
+        elif event_type == "on_tool_end" and event['name'] == "tavily_search_results_json":
+            output = event['data']['output']
+            results = []
+            if isinstance(output, list):
                 for item in output:
-                    if isinstance(item,dict) and 'url' in item:
-                        urls.append(item["url"])         
-                
-                urls_json=json.dumps(urls)
-                yield f"data: {{\"type\": \"search_results\", \"urls\": {urls_json}}}\n\n"
-    yield f"data: {{\"type\": \"end\"}}\n\n"
-                       
-    
+                    if isinstance(item, dict):
+                        results.append({
+                            "title": item.get("title", ""),
+                            "url": item.get("url", ""),
+                            "snippet": item.get("content", "")
+                        })
+            yield f"data: {{\"type\": \"search_results\", \"results\": {json.dumps(results)}}}\n\n"
 
+    yield f"data: {{\"type\": \"end\"}}\n\n"
 
 
 @api.get("/chat_stream/{message}")
